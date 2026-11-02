@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-FieldStation42 one-shot channel builder - fills a channel with
-public-domain TV from archive.org.
+FieldStation42 lineup builder - sets up a full cable lineup and fills it
+with public-domain content from archive.org.
 
     python3 fs42_autofill.py
 
 What it does, start to finish:
   1. Finds your FieldStation42 folder (current folder, or ~/FieldStation42)
-  2. Downloads classic cartoons, classic TV episodes, old movies and
-     vintage commercials from curated archive.org collections
-  3. Makes station-ID bumps and an off-air test pattern (needs ffmpeg)
-  4. Writes the channel config (confs/archive_tv.json)
-  5. Builds the catalog and a week of schedule
+  2. Downloads public-domain content for each channel in CHANNELS below,
+     sized to fit your free disk space
+  3. Shares one pool of vintage commercials across every channel
+     (hard links, so it costs no extra disk)
+  4. Makes station-ID bumps for each channel (needs ffmpeg)
+  5. Writes each channel's config and builds catalogs + a week of schedule
 
-Safe to re-run any time: files you already have are skipped, so running it
-again just tops things up. No extra Python packages needed.
+Safe to re-run any time: nothing is downloaded twice, and each run tops
+channels up as disk space allows.
 
-Tweak the numbers in CATEGORIES below if you want more or less content.
+Your own videos: drop files into any channel's folder (subfolders are fine,
+e.g. catalog/classic_cartoons/cartoons/my_show/) and run this again.
 """
 import json
 import os
@@ -32,62 +34,116 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-NETWORK_NAME = "ArchiveTV"
-SLUG = "archive_tv"
-UA = {"User-Agent": "fs42-autofill/1.0 (FieldStation42 channel builder)"}
+UA = {"User-Agent": "fs42-autofill/2.0 (FieldStation42 lineup builder)"}
 DOWNLOAD_THREADS = 4
-SMALL_MODE_FREE_GB = 25  # less free disk than this -> grab small versions
+META_THREADS = 8
+FULL_QUALITY_FREE_GB = 100   # less free disk than this -> smaller versions
+KEEP_FREE_GB = 4             # never fill the disk past this
+VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".mpg", ".mpeg", ".ts", ".m4v", ".webm", ".wmv")
+FIRST_CHANNEL = 4
 
-# Per folder: where to look, how much to grab, and length limits (seconds).
-CATEGORIES = {
-    "cartoons": dict(
-        queries=[
-            "collection:classic_cartoons AND mediatype:movies",
-            "collection:animationandcartoons AND mediatype:movies AND year:[1920 TO 1955]",
-        ],
-        max_files=40, max_gb=2.5, min_s=120, max_s=1200, max_file_mb=400, per_item=3,
-    ),
-    "shows": dict(
-        queries=[
-            "collection:classic_tv AND mediatype:movies",
-            "collection:television AND mediatype:movies AND year:[1949 TO 1963]",
-        ],
-        max_files=30, max_gb=6, min_s=1200, max_s=3900, max_file_mb=1500, per_item=2,
-    ),
-    "movies": dict(
-        queries=[
-            "collection:feature_films AND mediatype:movies AND year:[1930 TO 1962]",
-            "collection:Film_Noir AND mediatype:movies",
-        ],
-        max_files=6, max_gb=5, min_s=3600, max_s=9000, max_file_mb=2500, per_item=1,
-    ),
-    "commercial": dict(
-        queries=[
-            "collection:adviews AND mediatype:movies",
-            "collection:classic_tv_commercials AND mediatype:movies",
-            "collection:prelinger AND subject:commercials",
-        ],
-        max_files=80, max_gb=1, min_s=10, max_s=120, max_file_mb=60, per_item=1,
-    ),
-}
 
-# Every hour is filled so the channel never goes dark.
-WEEKDAY = {
-    0: "movies", 1: "shows", 2: "shows", 3: "shows", 4: "shows", 5: "shows",
-    6: "cartoons", 7: "cartoons", 8: "shows", 9: "shows", 10: "shows", 11: "shows",
-    12: "movies", 13: "shows", 14: "shows", 15: "cartoons", 16: "cartoons", 17: "shows",
-    18: "shows", 19: "shows", 20: "movies", 21: "shows", 22: "shows", 23: "shows",
-}
-WEEKEND = {
-    0: "movies", 1: "shows", 2: "shows", 3: "shows", 4: "shows", 5: "shows",
-    6: "cartoons", 7: "cartoons", 8: "cartoons", 9: "cartoons", 10: "cartoons", 11: "cartoons",
-    12: "movies", 13: "shows", 14: "movies", 15: "shows", 16: "shows", 17: "shows",
-    18: "shows", 19: "shows", 20: "movies", 21: "shows", 22: "movies", 23: "shows",
-}
-FALLBACK = {
-    "movies": ["shows", "cartoons"],
-    "shows": ["cartoons", "movies"],
-    "cartoons": ["shows", "movies"],
+def titles(collection, names):
+    joined = " OR ".join(f'"{n}"' for n in names)
+    return f"collection:{collection} AND mediatype:movies AND title:({joined})"
+
+
+# Each folder: where to look on archive.org, length limits (seconds), max file
+# size in MB (small/full quality), how many files at most, how many per
+# archive.org item, and its share of the download budget.
+def folder(queries, min_s, max_s, small_mb, full_mb, max_files, per_item, weight, min_files=3):
+    return dict(queries=queries, min_s=min_s, max_s=max_s, small_mb=small_mb, full_mb=full_mb,
+                max_files=max_files, per_item=per_item, weight=weight, min_files=min_files)
+
+
+CHANNELS = [
+    dict(name="Classic Cartoons", ads=["kids"], slug="classic_cartoons",
+         folders={"cartoons": folder([
+             "collection:classic_cartoons AND mediatype:movies",
+             'mediatype:movies AND title:("pantry panic")',
+         ], 120, 1500, 150, 500, 120, 3, 1.2)},
+         clip_shows=["cartoons"], schedule="cartoons"),
+
+    dict(name="Adult Animation", ads=["80s90s"], slug="adult_animation",
+         folders={"shorts": folder([
+             'mediatype:movies AND title:("private snafu")',
+             'collection:classic_cartoons AND mediatype:movies AND title:("betty boop")',
+         ], 60, 1500, 120, 400, 60, 4, 0.6)},
+         clip_shows=["shorts"], schedule="shorts"),
+
+    dict(name="Anime", ads=["kids", "80s90s"], slug="anime",
+         folders={"shows": folder([], 60, 9000, 0, 0, 0, 0, 0)},
+         schedule="shows"),
+
+    dict(name="Animals", ads=["retro", "kids"], slug="animals",
+         folders={"nature": folder([
+             "collection:prelinger AND mediatype:movies AND "
+             "subject:(animals OR wildlife OR nature OR zoology OR birds OR insects)",
+             "collection:educationalfilms AND mediatype:movies AND "
+             "subject:(animals OR wildlife OR nature)",
+         ], 300, 2400, 200, 600, 60, 2, 1.0)},
+         clip_shows=["nature"], schedule="nature"),
+
+    dict(name="Classic Movies", ads=["retro"], slug="classic_movies",
+         folders={"movies": folder([
+             "collection:feature_films AND mediatype:movies AND year:[1925 TO 1962]",
+         ], 3600, 9000, 800, 2500, 30, 1, 2.2, min_files=2)},
+         schedule="movies"),
+
+    dict(name="Sitcoms", ads=["retro", "80s90s"], slug="sitcoms",
+         folders={"sitcoms": folder([
+             titles("classic_tv", ["beverly hillbillies", "dick van dyke", "lucy show",
+                                   "petticoat junction", "jack benny", "burns and allen",
+                                   "ozzie and harriet", "my little margie", "life of riley",
+                                   "topper", "private secretary"]),
+         ], 1200, 2100, 250, 900, 80, 2, 1.6)},
+         schedule="sitcoms"),
+
+    dict(name="Game Shows", ads=["retro", "80s90s"], slug="game_shows",
+         folders={"gameshows": folder([
+             titles("classic_tv", ["you bet your life"]),
+             'collection:classic_tv AND mediatype:movies AND subject:("game show" OR "quiz show")',
+         ], 1200, 2100, 250, 900, 60, 3, 1.0)},
+         schedule="gameshows"),
+
+    dict(name="Music Videos", ads=["80s90s"], slug="music_videos",
+         folders={"videos": folder([
+             "mediatype:movies AND (title:soundie OR title:soundies OR subject:soundies)",
+         ], 90, 420, 60, 200, 150, 4, 0.6)},
+         clip_shows=["videos"], schedule="videos"),
+
+    dict(name="Crime & Mystery", ads=["retro"], slug="crime_mystery",
+         folders={
+             "series": folder([
+                 titles("classic_tv", ["dragnet", "sherlock holmes", "boston blackie",
+                                       "racket squad", "front page detective", "eddie drake",
+                                       "one step beyond", "mark saber", "dangerous assignment"]),
+             ], 1200, 3900, 300, 1000, 60, 2, 1.1),
+             "noir": folder([
+                 "collection:Film_Noir AND mediatype:movies",
+             ], 3600, 8400, 800, 2500, 25, 1, 1.6, min_files=2),
+         },
+         schedule={h: ("noir" if h in (20, 22, 0, 2) else "series") for h in range(24)}),
+]
+
+# Commercial pools, matched to each channel's era/audience. Includes the
+# VHS commercial-and-bumper packs in archive.org's Classic TV Commercials
+# collection. Packs hold many clips each, hence the high per-item limit.
+AD_POOLS = {
+    "kids": folder([
+        'mediatype:movies AND title:(commercials AND ("saturday morning" OR cartoon OR cartoons OR kids OR toy OR toys))',
+        'mediatype:movies AND subject:commercials AND subject:(toys OR cereal OR "saturday morning" OR kids OR children)',
+    ], 10, 120, 40, 80, 120, 40, 0.4, min_files=20),
+    "80s90s": folder([
+        "identifier:commercialpack*",
+        "collection:classic_tv_commercials AND mediatype:movies",
+        "mediatype:movies AND title:(commercials AND (80s OR 90s OR 1980s OR 1990s))",
+        "mediatype:movies AND subject:commercials AND subject:bumpers",
+    ], 10, 120, 40, 80, 150, 40, 0.4, min_files=20),
+    "retro": folder([
+        "collection:adviews AND mediatype:movies",
+        "collection:prelinger AND subject:commercials",
+    ], 10, 120, 40, 80, 150, 1, 0.3, min_files=20),
 }
 
 
@@ -95,11 +151,11 @@ def say(msg=""):
     print(msg, flush=True)
 
 
-# ---------------------------------------------------------------- setup
+# ---------------------------------------------------------------- files
 
 def find_root():
     candidates = [os.getcwd(), os.path.expanduser("~/FieldStation42"),
-                  os.path.dirname(os.path.abspath(__file__))]
+                  os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
     for c in candidates:
         if os.path.isfile(os.path.join(c, "station_42.py")):
             return c
@@ -114,6 +170,35 @@ def find_root():
 def safe_name(s):
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("._")
     return s or "file"
+
+
+def videos_in(d):
+    out = []
+    for base, _, files in os.walk(d):
+        out += [os.path.join(base, f) for f in files if f.lower().endswith(VIDEO_EXTS)]
+    return out
+
+
+def same_video_key(filename):
+    """Same video regardless of which archive.org version (_512kb, .ia) it is."""
+    k = filename.lower()
+    for suffix in ("_512kb.mp4", ".ia.mp4", ".mp4"):
+        if k.endswith(suffix):
+            return k[: -len(suffix)]
+    return k
+
+
+def link_file(src, dst):
+    """Hard link (no extra disk); fall back to symlink, then copy."""
+    if os.path.exists(dst):
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        try:
+            os.symlink(os.path.abspath(src), dst)
+        except OSError:
+            shutil.copy(src, dst)
 
 
 # ---------------------------------------------------------------- archive.org
@@ -133,11 +218,14 @@ def get_json(url, tries=3):
 def search(query, page, rows=100):
     params = [("q", query), ("fl[]", "identifier"), ("sort[]", "downloads desc"),
               ("rows", str(rows)), ("page", str(page)), ("output", "json")]
-    url = "https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(params)
-    data = get_json(url)
+    data = get_json("https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(params))
     if not data:
         return []
     return [d["identifier"] for d in data.get("response", {}).get("docs", []) if "identifier" in d]
+
+
+def metadata(ident):
+    return ident, get_json(f"https://archive.org/metadata/{urllib.parse.quote(ident)}")
 
 
 def parse_length(v):
@@ -156,7 +244,7 @@ def parse_length(v):
 
 
 def pick_files(meta, cfg, small):
-    """Choose one MP4 version per video in an item, within length/size limits."""
+    """One MP4 version per video in an item, within length/size limits."""
     groups = {}
     for f in meta.get("files", []):
         name = f.get("name", "")
@@ -172,8 +260,9 @@ def pick_files(meta, cfg, small):
         groups.setdefault(stem, {})[kind] = f
 
     order = ["small", "ia", "full"] if small else ["full", "ia", "small"]
+    max_bytes = (cfg["small_mb"] if small else cfg["full_mb"]) * 1_000_000
     picks = []
-    for stem, kinds in groups.items():
+    for kinds in groups.values():
         length = None
         for f in kinds.values():
             length = length or parse_length(f.get("length"))
@@ -184,71 +273,95 @@ def pick_files(meta, cfg, small):
             if not f:
                 continue
             try:
-                size = int(f.get("size") or 0)
+                size = int(float(f.get("size") or 0))
             except ValueError:
                 size = 0
-            if 0 < size <= cfg["max_file_mb"] * 1_000_000:
+            if 0 < size <= max_bytes:
                 picks.append((f["name"], size))
                 break
     random.shuffle(picks)
     return picks[: cfg["per_item"]]
 
 
-def plan_category(tag, cfg, dest, small, scale):
-    """Work out which files to download for one folder."""
-    max_files = max(1, int(cfg["max_files"] * scale))
-    max_bytes = cfg["max_gb"] * scale * 1e9
+class Budget:
+    def __init__(self, hard_limit):
+        self.hard_limit = hard_limit
+        self.planned = 0
 
-    have = [f for f in os.listdir(dest) if f.lower().endswith(".mp4")]
-    used_bytes = sum(os.path.getsize(os.path.join(dest, f)) for f in have)
-    count = len(have)
+
+def plan_folder(label, cfg, dest, small, alloc, budget, index, meta_pool):
+    """Decide what to download (or link from elsewhere) for one folder."""
+    existing = videos_in(dest)
+    count = len(existing)
+    dest_keys = {same_video_key(os.path.basename(p)) for p in existing}
     plan = []
-    if count >= max_files or used_bytes >= max_bytes:
-        say(f"  {tag}: already have {count} videos, skipping")
+    if not cfg["queries"] or count >= cfg["max_files"]:
         return plan
-
+    used = 0
     seen = set()
+
+    def done():
+        return count >= cfg["max_files"] or (used >= alloc * 0.97 and count >= cfg["min_files"])
+
     for query in cfg["queries"]:
-        for page in range(1, 6):
-            ids = search(query, page)
+        for page in range(1, 11):
+            ids = [i for i in search(query, page) if i not in seen]
             if not ids:
                 break
-            for ident in ids:
-                if ident in seen:
-                    continue
-                seen.add(ident)
-                meta = get_json(f"https://archive.org/metadata/{urllib.parse.quote(ident)}")
-                if not meta or meta.get("is_dark"):
-                    continue
-                added = False
-                for name, size in pick_files(meta, cfg, small):
-                    out = os.path.join(
-                        dest, f"{safe_name(ident)[:40]}__{safe_name(os.path.basename(name))}")
-                    if os.path.exists(out):
+            seen.update(ids)
+            for start in range(0, len(ids), META_THREADS * 2):
+                chunk = ids[start:start + META_THREADS * 2]
+                for ident, meta in meta_pool.map(metadata, chunk):
+                    if not meta or meta.get("is_dark"):
                         continue
-                    if used_bytes + size > max_bytes:
-                        continue
-                    plan.append((ident, name, out, size))
-                    used_bytes += size
-                    count += 1
-                    added = True
-                    if count >= max_files:
-                        break
-                if added:
-                    say(f"  {tag}: {count}/{max_files} picked ({used_bytes/1e9:.1f} GB)")
-                if count >= max_files or used_bytes >= max_bytes * 0.97:
-                    return plan
+                    added = False
+                    for name, size in pick_files(meta, cfg, small):
+                        base = f"{safe_name(ident)[:40]}__{safe_name(os.path.basename(name))}"
+                        out = os.path.join(dest, base)
+                        key = same_video_key(base)
+                        if key in dest_keys or os.path.exists(out):
+                            continue
+                        dest_keys.add(key)
+                        if key in index:  # already downloaded for another channel
+                            link_file(index[key], out)
+                            count += 1
+                            added = True
+                            continue
+                        over_alloc = used + size > alloc and count >= cfg["min_files"]
+                        if over_alloc or budget.planned + size > budget.hard_limit:
+                            continue
+                        plan.append((ident, name, out, size))
+                        used += size
+                        budget.planned += size
+                        count += 1
+                        added = True
+                        if done():
+                            break
+                    if added:
+                        say(f"  {label}: {count} videos ({used / 1e9:.1f} GB new)")
+                    if done():
+                        return plan
     return plan
 
 
-def download(ident, name, out):
+def download(ident, name, out, size):
     url = f"https://archive.org/download/{urllib.parse.quote(ident)}/{urllib.parse.quote(name)}"
     part = out + ".part"
+    label = os.path.basename(name)[:50]
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as fh:
-                shutil.copyfileobj(r, fh, 1024 * 1024)
+                got, next_mark = 0, 0.25
+                while True:
+                    chunk = r.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    got += len(chunk)
+                    if size > 80_000_000 and got / size >= next_mark:
+                        say(f"     ...{label} {int(next_mark * 100)}%")
+                        next_mark += 0.25
             os.replace(part, out)
             return True
         except urllib.error.HTTPError as e:
@@ -281,12 +394,11 @@ def make_card(ffmpeg, out, seconds, text, bg):
         audio = f"sine=frequency=1000:sample_rate=48000:duration={seconds}"
     else:
         video = f"color=c={bg}:size=640x480:rate=30:duration={seconds}"
-        audio = f"anullsrc=r=48000:cl=stereo"
+        audio = "anullsrc=r=48000:cl=stereo"
     cmd = [ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", video,
            "-f", "lavfi", "-i", audio, "-t", str(seconds)]
     enc = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-shortest", out]
-
     tf = None
     if text:
         fd, tf = tempfile.mkstemp(suffix=".txt")
@@ -294,57 +406,76 @@ def make_card(ffmpeg, out, seconds, text, bg):
             fh.write(text)
         font = next((p for p in FONT_PATHS if os.path.exists(p)), None)
         draw = (f"drawtext={'fontfile=' + font + ':' if font else ''}textfile={tf}:"
-                "fontcolor=white:fontsize=48:line_spacing=14:"
+                "fontcolor=white:fontsize=44:line_spacing=14:"
                 "x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.55:boxborderw=24")
         if subprocess.run(cmd + ["-vf", draw] + enc).returncode == 0:
             os.remove(tf)
             return True
     if tf:
         os.remove(tf)
-    return subprocess.run(cmd + enc).returncode == 0  # plain card, no text
+    return subprocess.run(cmd + enc).returncode == 0
+
+
+def make_bumps(ffmpeg, bump_dir, name, channel):
+    title = name.upper()
+    cards = [
+        ("station_id.mp4", 6, f"{title}\nCHANNEL {channel}", "bars"),
+        ("right_back.mp4", 5, "WE'LL BE RIGHT BACK", "navy"),
+        ("now_back.mp4", 4, f"NOW BACK TO\n{title}", "navy"),
+        ("watching.mp4", 6, f"YOU'RE WATCHING\n{title}", "darkred"),
+        ("stay_tuned.mp4", 5, "STAY TUNED", "darkgreen"),
+    ]
+    for fname, secs, text, bg in cards:
+        make_card(ffmpeg, os.path.join(bump_dir, fname), secs, text, bg)
 
 
 # ---------------------------------------------------------------- config
 
-def pick_channel(root, conf_path):
-    if os.path.exists(conf_path):
-        try:
-            with open(conf_path) as fh:
-                return json.load(fh)["station_conf"]["channel_number"]
-        except Exception:
-            pass
-    used = set()
+def read_channel(path):
+    try:
+        with open(path) as fh:
+            return int(json.load(fh)["station_conf"]["channel_number"])
+    except Exception:
+        return None
+
+
+def assign_channels(root):
     confs = os.path.join(root, "confs")
+    ours = {os.path.join(confs, f"{c['slug']}.json") for c in CHANNELS}
+    used = set()
     for f in os.listdir(confs):
         p = os.path.join(confs, f)
-        if f.endswith(".json") and os.path.isfile(p) and p != conf_path:
-            try:
-                with open(p) as fh:
-                    used.add(int(json.load(fh)["station_conf"]["channel_number"]))
-            except Exception:
-                pass
-    ch = 3
-    while ch in used:
-        ch += 1
-    return ch
+        if f.endswith(".json") and os.path.isfile(p) and p not in ours:
+            n = read_channel(p)
+            if n is not None:
+                used.add(n)
+    numbers = {}
+    for c in CHANNELS:
+        n = read_channel(os.path.join(confs, f"{c['slug']}.json"))
+        if n is not None and n not in used:
+            numbers[c["slug"]] = n
+            used.add(n)
+    nxt = FIRST_CHANNEL
+    for c in CHANNELS:
+        if c["slug"] in numbers:
+            continue
+        while nxt in used:
+            nxt += 1
+        numbers[c["slug"]] = nxt
+        used.add(nxt)
+    return numbers
 
 
-def build_day(template, available):
-    def resolve(tag):
-        if tag in available:
-            return tag
-        for alt in FALLBACK[tag]:
-            if alt in available:
-                return alt
-        return None
-    return {str(h): {"tags": resolve(t)} for h, t in template.items()}
-
-
-def write_config(conf_path, channel, available, off_air_ok, has_commercials):
+def write_config(root, ch, number, available, has_commercials, off_air):
+    sched = ch["schedule"]
+    if isinstance(sched, str):
+        sched = {h: sched for h in range(24)}
+    first = sorted(available)[0]
+    day = {str(h): {"tags": (t if t in available else first)} for h, t in sched.items()}
     conf = {
-        "network_name": NETWORK_NAME,
-        "channel_number": channel,
-        "content_dir": f"catalog/{SLUG}",
+        "network_name": ch["name"],
+        "channel_number": number,
+        "content_dir": f"catalog/{ch['slug']}",
         "commercial_dir": "commercial",
         "bump_dir": "bump",
         "schedule_increment": 30,
@@ -352,19 +483,15 @@ def write_config(conf_path, channel, available, off_air_ok, has_commercials):
     }
     if not has_commercials:
         conf["commercial_free"] = True
-    if off_air_ok:
-        conf["off_air_video"] = f"runtime/{SLUG}_off_air.mp4"
-    if "cartoons" in available:
-        conf["clip_shows"] = [{"tags": "cartoons", "duration": 60}]
-    conf["day_templates"] = {
-        "weekday": build_day(WEEKDAY, available),
-        "weekend": build_day(WEEKEND, available),
-    }
-    for d in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-        conf[d] = "weekday"
-    conf["saturday"] = "weekend"
-    conf["sunday"] = "weekend"
-    with open(conf_path, "w") as fh:
+    if off_air:
+        conf["off_air_video"] = off_air
+    clips = [{"tags": t, "duration": 60} for t in ch.get("clip_shows", []) if t in available]
+    if clips:
+        conf["clip_shows"] = clips
+    conf["day_templates"] = {"everyday": day}
+    for d in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
+        conf[d] = "everyday"
+    with open(os.path.join(root, "confs", f"{ch['slug']}.json"), "w") as fh:
         json.dump({"station_conf": conf}, fh, indent=2)
 
 
@@ -374,111 +501,137 @@ def main():
     root = find_root()
     if not root:
         say("Couldn't find your FieldStation42 folder (the one with station_42.py).")
-        say("cd into it and run this again:  cd ~/FieldStation42 && python3 fs42_autofill.py")
+        say("cd into it and run this again.")
         sys.exit(1)
     say(f"FieldStation42 folder: {root}")
-
-    content = os.path.join(root, "catalog", SLUG)
-    for sub in list(CATEGORIES) + ["bump"]:
-        os.makedirs(os.path.join(content, sub), exist_ok=True)
+    catalog = os.path.join(root, "catalog")
+    pools = {k: os.path.join(catalog, "_ads", k) for k in AD_POOLS}
+    for d in pools.values():
+        os.makedirs(d, exist_ok=True)
     os.makedirs(os.path.join(root, "runtime"), exist_ok=True)
     os.makedirs(os.path.join(root, "confs"), exist_ok=True)
+    for ch in CHANNELS:
+        for sub in list(ch["folders"]) + ["commercial", "bump"]:
+            os.makedirs(os.path.join(catalog, ch["slug"], sub), exist_ok=True)
 
-    free_gb = shutil.disk_usage(content).free / 1e9
-    small = free_gb < SMALL_MODE_FREE_GB
-    scale = 1.0
-    if small:
-        scale = max(0.15, min(0.5, (free_gb - 3) / 40))
-        say(f"Only {free_gb:.0f} GB free, so grabbing smaller, lower-res versions.")
+    # clean up anything left half-downloaded by an earlier run
+    for base, _, files in os.walk(catalog):
+        for f in files:
+            if f.endswith(".part"):
+                os.remove(os.path.join(base, f))
 
-    # 1. pick what to download
-    say("\nFinding videos on archive.org (takes a few minutes)...")
+    # everything already downloaded, so nothing is fetched twice
+    index = {}
+    for p in videos_in(catalog):
+        index.setdefault(same_video_key(os.path.basename(p)), p)
+    # reuse commercials from channels made outside this lineup (e.g. ArchiveTV)
+    ours = {c["slug"] for c in CHANNELS} | {"_ads"}
+    for name in os.listdir(catalog):
+        com = os.path.join(catalog, name, "commercial")
+        if name not in ours and os.path.isdir(com):
+            for p in videos_in(com):
+                link_file(p, os.path.join(pools["retro"], os.path.basename(p)))
+
+    free_gb = shutil.disk_usage(catalog).free / 1e9
+    small = free_gb < FULL_QUALITY_FREE_GB
+    budget_gb = max(0.0, (free_gb - KEEP_FREE_GB) * 0.85)
+    say(f"{free_gb:.0f} GB free - using up to {budget_gb:.1f} GB for new videos"
+        + (" (smaller versions to save space)" if small else ""))
+
+    jobs = [(f"commercials / {k}", cfg, pools[k]) for k, cfg in AD_POOLS.items()]
+    for ch in CHANNELS:
+        for tag, cfg in ch["folders"].items():
+            jobs.append((f"{ch['name']} / {tag}", cfg, os.path.join(catalog, ch["slug"], tag)))
+    total_weight = sum(cfg["weight"] for _, cfg, _ in jobs if cfg["queries"]) or 1
+    budget = Budget(max(0.0, (free_gb - KEEP_FREE_GB) * 1e9))
+
+    say("\nFinding videos on archive.org (several minutes)...")
     plan = []
-    for tag, cfg in CATEGORIES.items():
-        plan += plan_category(tag, cfg, os.path.join(content, tag), small, scale)
+    with ThreadPoolExecutor(META_THREADS) as meta_pool:
+        for label, cfg, dest in jobs:
+            alloc = budget_gb * 1e9 * cfg["weight"] / total_weight
+            plan += plan_folder(label, cfg, dest, small, alloc, budget, index, meta_pool)
 
-    # 2. download
     if plan:
         total = sum(p[3] for p in plan) / 1e9
-        say(f"\nDownloading {len(plan)} videos (~{total:.1f} GB). Grab a snack, this can take a while.")
+        say(f"\nDownloading {len(plan)} videos (~{total:.1f} GB). Big files show % progress.")
         done = 0
-        with ThreadPoolExecutor(DOWNLOAD_THREADS) as pool:
-            futures = {pool.submit(download, i, n, o): (n, s) for i, n, o, s in plan}
+        with ThreadPoolExecutor(DOWNLOAD_THREADS) as pool_dl:
+            futures = {pool_dl.submit(download, *p): p for p in plan}
             for fut in as_completed(futures):
                 done += 1
-                name, size = futures[fut]
+                _, name, _, size = futures[fut]
                 status = "ok  " if fut.result() else "skip"
-                say(f"  [{done}/{len(plan)}] {status} {os.path.basename(name)[:60]} ({size/1e6:.0f} MB)")
+                say(f"  [{done}/{len(plan)}] {status} {os.path.basename(name)[:55]} ({size / 1e6:.0f} MB)")
     else:
         say("\nNothing new to download.")
 
-    def count(tag):
-        d = os.path.join(content, tag)
-        return len([f for f in os.listdir(d) if f.lower().endswith(".mp4")])
+    # each channel gets its matching commercial pools (hard links, no extra space)
+    pool_files = {k: videos_in(d) for k, d in pools.items()}
+    any_ads = [p for files in pool_files.values() for p in files]
+    for ch in CHANNELS:
+        com = os.path.join(catalog, ch["slug"], "commercial")
+        mine = [p for k in ch["ads"] for p in pool_files[k]] or any_ads
+        for p in mine:
+            link_file(p, os.path.join(com, os.path.basename(p)))
 
-    available = {t for t in ("cartoons", "shows", "movies") if count(t) > 0}
-    if not available:
-        say("\nNo videos downloaded - archive.org may be down. Try again later.")
-        sys.exit(1)
-    has_commercials = count("commercial") > 0
-
-    # 3. bumps + off-air pattern
-    conf_path = os.path.join(root, "confs", f"{SLUG}.json")
-    channel = pick_channel(root, conf_path)
+    numbers = assign_channels(root)
     ffmpeg = shutil.which("ffmpeg")
-    off_air_ok = False
-    bump_dir = os.path.join(content, "bump")
+    off_air = None
     if ffmpeg:
         say("\nMaking station bumps...")
-        cards = [
-            ("station_id.mp4", 6, f"{NETWORK_NAME}\nCHANNEL {channel}", "bars"),
-            ("right_back.mp4", 5, "WE'LL BE RIGHT BACK", "navy"),
-            ("now_back.mp4", 4, f"NOW BACK TO\n{NETWORK_NAME}", "navy"),
-            ("watching.mp4", 6, f"YOU'RE WATCHING\n{NETWORK_NAME}", "darkred"),
-            ("stay_tuned.mp4", 5, "STAY TUNED", "darkgreen"),
-        ]
-        for fname, secs, text, bg in cards:
-            make_card(ffmpeg, os.path.join(bump_dir, fname), secs, text, bg)
-        off_air_ok = make_card(ffmpeg, os.path.join(root, "runtime", f"{SLUG}_off_air.mp4"),
-                               30, "PLEASE STAND BY", "bars")
-    if count("bump") == 0:
-        if has_commercials:
-            # no ffmpeg: borrow a few short commercials as bumps
-            com = os.path.join(content, "commercial")
-            for f in sorted(os.listdir(com))[:4]:
-                shutil.copy(os.path.join(com, f), os.path.join(bump_dir, f))
-            say("ffmpeg not found - used a few commercials as bumps instead.")
-        else:
-            say("\nNeed ffmpeg to make bumps:  sudo apt install ffmpeg   then run this again.")
-            sys.exit(1)
+        if make_card(ffmpeg, os.path.join(root, "runtime", "fs42_off_air.mp4"), 30,
+                     "PLEASE STAND BY", "bars"):
+            off_air = "runtime/fs42_off_air.mp4"
 
-    # 4. channel config
-    write_config(conf_path, channel, available, off_air_ok, has_commercials)
-    say(f"\nWrote channel config: confs/{SLUG}.json  (channel {channel})")
+    ready, empty = [], []
+    for ch in CHANNELS:
+        base = os.path.join(catalog, ch["slug"])
+        available = {t for t in ch["folders"] if videos_in(os.path.join(base, t))}
+        if not available:
+            empty.append(ch)
+            continue
+        bump_dir = os.path.join(base, "bump")
+        if ffmpeg:
+            make_bumps(ffmpeg, bump_dir, ch["name"], numbers[ch["slug"]])
+        if not videos_in(bump_dir):
+            for p in any_ads[:4]:
+                link_file(p, os.path.join(bump_dir, os.path.basename(p)))
+        if not videos_in(bump_dir):
+            say(f"\nSkipping {ch['name']}: needs ffmpeg for bumps (sudo apt install ffmpeg).")
+            continue
+        has_ads = bool(videos_in(os.path.join(base, "commercial")))
+        write_config(root, ch, numbers[ch["slug"]], available, has_ads, off_air)
+        ready.append(ch)
 
-    # 5. catalog + schedule
-    py = os.path.join(root, "env", "bin", "python3")
-    if not os.path.exists(py):
-        py = sys.executable
-    say("\nBuilding catalog (reads every video, give it a few minutes)...")
-    r1 = subprocess.run([py, "station_42.py", "--rebuild_catalog", NETWORK_NAME], cwd=root)
-    say("\nBuilding a week of schedule...")
-    r2 = subprocess.run([py, "station_42.py", "--add_week", NETWORK_NAME], cwd=root)
-
-    say("\n" + "=" * 60)
-    say(f"  cartoons: {count('cartoons')}   shows: {count('shows')}   movies: {count('movies')}")
-    say(f"  commercials: {count('commercial')}   bumps: {count('bump')}")
-    if r1.returncode == 0 and r2.returncode == 0:
-        say(f"\n  {NETWORK_NAME} is ready on channel {channel}. To watch:")
-        say(f"    cd {root}")
-        say("    source env/bin/activate")
-        say("    python3 field_player.py")
+    if ready:
+        py = os.path.join(root, "env", "bin", "python3")
+        if not os.path.exists(py):
+            py = sys.executable
+        say("\nBuilding catalogs (reads every video, give it a few minutes)...")
+        r1 = subprocess.run([py, "station_42.py", "--rebuild_catalog"], cwd=root)
+        say("\nBuilding a week of schedule...")
+        r2 = subprocess.run([py, "station_42.py", "--add_week"], cwd=root)
+        ok = r1.returncode == 0 and r2.returncode == 0
     else:
-        say("\n  Videos and config are in place, but the catalog/schedule step hit an error.")
+        ok = False
+
+    say("\n" + "=" * 62)
+    for ch in sorted(ready, key=lambda c: numbers[c["slug"]]):
+        n = sum(len(videos_in(os.path.join(catalog, ch["slug"], t))) for t in ch["folders"])
+        say(f"  Ch {numbers[ch['slug']]:>2}  {ch['name']:<18} {n} videos")
+    for ch in empty:
+        say(f"  --     {ch['name']:<18} empty: add your own videos to")
+        say(f"         catalog/{ch['slug']}/{list(ch['folders'])[0]}/  then run this again")
+    if ok:
+        say("\n  Ready! To watch:")
+        say(f"    cd {root} && source env/bin/activate && python3 field_player.py")
+    elif ready:
+        say("\n  Videos and configs are in place, but the catalog/schedule step hit an error.")
         say("  Close any other FieldStation42 window, then run:")
         say(f"    cd {root} && source env/bin/activate")
         say("    python3 station_42.py --rebuild_catalog && python3 station_42.py --add_week")
-    say("=" * 60)
+    say("=" * 62)
 
 
 if __name__ == "__main__":

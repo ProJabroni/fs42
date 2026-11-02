@@ -1,13 +1,24 @@
 # fs42
 
-One-command channel builder for [FieldStation42](https://github.com/shane-mason/FieldStation42).
-Fills a channel with public-domain cartoons, classic TV, old movies and vintage
-commercials from archive.org, makes station bumps, writes the channel config,
-and builds the catalog and a week of schedule.
+One-command lineup builder for [FieldStation42](https://github.com/shane-mason/FieldStation42).
+
+Sets up nine channels (Classic Cartoons, Adult Animation, Anime, Animals,
+Classic Movies, Sitcoms, Game Shows, Music Videos, Crime & Mystery), fills
+them with public-domain content from archive.org sized to your free disk
+space, gives each channel era-matched vintage commercials, makes station
+bumps, and builds catalogs and a week of schedule.
 
 ```
-git clone https://github.com/ProJabroni/fs42
-python3 fs42/fs42_autofill.py
+git clone https://github.com/ProJabroni/fs42 fs42-setup
+python3 fs42-setup/fs42_autofill.py
 ```
 
-Re-run it any time to top up content; it skips anything already downloaded.
+Update and re-run any time; it tops channels up and never downloads twice:
+
+```
+git -C fs42-setup pull && python3 fs42-setup/fs42_autofill.py
+```
+
+**Your own videos:** drop files into a channel's folder (subfolders are fine),
+for example `catalog/classic_cartoons/cartoons/my_show/`, then re-run.
+The Anime channel only turns on once you've added videos to `catalog/anime/shows/`.
