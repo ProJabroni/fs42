@@ -174,7 +174,7 @@ def safe_name(s):
 
 def videos_in(d):
     out = []
-    for base, _, files in os.walk(d):
+    for base, _, files in os.walk(d, followlinks=True):
         out += [os.path.join(base, f) for f in files if f.lower().endswith(VIDEO_EXTS)]
     return out
 
@@ -506,13 +506,7 @@ def main():
     say(f"FieldStation42 folder: {root}")
     catalog = os.path.join(root, "catalog")
     pools = {k: os.path.join(catalog, "_ads", k) for k in AD_POOLS}
-    for d in pools.values():
-        os.makedirs(d, exist_ok=True)
-    os.makedirs(os.path.join(root, "runtime"), exist_ok=True)
-    os.makedirs(os.path.join(root, "confs"), exist_ok=True)
-    for ch in CHANNELS:
-        for sub in list(ch["folders"]) + ["commercial", "bump"]:
-            os.makedirs(os.path.join(catalog, ch["slug"], sub), exist_ok=True)
+    prepare(root)
 
     # clean up anything left half-downloaded by an earlier run
     for base, _, files in os.walk(catalog):
@@ -565,6 +559,27 @@ def main():
                 say(f"  [{done}/{len(plan)}] {status} {os.path.basename(name)[:55]} ({size / 1e6:.0f} MB)")
     else:
         say("\nNothing new to download.")
+
+    finalize(root)
+
+
+def prepare(root):
+    """Create folders for every channel and commercial pool."""
+    catalog = os.path.join(root, "catalog")
+    for k in AD_POOLS:
+        os.makedirs(os.path.join(catalog, "_ads", k), exist_ok=True)
+    os.makedirs(os.path.join(root, "runtime"), exist_ok=True)
+    os.makedirs(os.path.join(root, "confs"), exist_ok=True)
+    for ch in CHANNELS:
+        for sub in list(ch["folders"]) + ["commercial", "bump"]:
+            os.makedirs(os.path.join(catalog, ch["slug"], sub), exist_ok=True)
+
+
+def finalize(root):
+    """Commercials, bumps, channel configs, catalogs and a week of schedule."""
+    catalog = os.path.join(root, "catalog")
+    pools = {k: os.path.join(catalog, "_ads", k) for k in AD_POOLS}
+    prepare(root)
 
     # each channel gets its matching commercial pools (hard links, no extra space)
     pool_files = {k: videos_in(d) for k, d in pools.items()}

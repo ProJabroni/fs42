@@ -22,3 +22,15 @@ git -C fs42-setup pull && python3 fs42-setup/fs42_autofill.py
 **Your own videos:** drop files into a channel's folder (subfolders are fine),
 for example `catalog/classic_cartoons/cartoons/my_show/`, then re-run.
 The Anime channel only turns on once you've added videos to `catalog/anime/shows/`.
+
+## Your Google Drive videos
+
+Plug an external drive into the Pi, then:
+
+```
+git -C fs42-setup pull && python3 fs42-setup/fs42_gdrive.py
+```
+
+It signs in to Google (read-only), lists your Drive folders, lets you pick which
+folders go on which channel, copies just the video files to the external drive,
+and links them into the channels. Run it again later to grab new episodes.
